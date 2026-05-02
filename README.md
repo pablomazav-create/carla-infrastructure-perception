@@ -43,4 +43,4 @@ The core of the project is the `on_lidar` callback logic:
 - `docs/`: Technical notes on occupancy grid calculations.
 
 ## 📫 Contact
-[LinkedIn](TU_URL_DE_LINKEDIN) | [Email](TU_CORREO)
+[LinkedIn](https://www.linkedin.com/in/pablo-de-la-maza-valles/) | [Email](pablomazav@gmail.com)
