@@ -1,0 +1,668 @@
+import carla
+import time
+import math
+import struct
+import random
+
+# =========================================================
+# MAP CONFIGURATION
+# =========================================================
+MAP_NAME = "Town04"
+
+# =========================================================
+# MODE (RENDER ON)
+# =========================================================
+NO_RENDERING_MODE = False        # <-- RENDERING ON
+SYNCHRONOUS_MODE = True
+FIXED_DT = 0.05                  # 20 FPS sim
+
+# =========================================================
+# ROBUST STRAIGHT SEGMENT SEARCH (>=300m)
+# =========================================================
+MIN_STRAIGHT_LEN_M = 300.0
+STEP_M = 5.0
+SEARCH_SPAWNS_TO_TRY = 600
+
+# =========================================================
+# INFRASTRUCTURE (props)
+# =========================================================
+# Removed gantry structure: NO posts, NO arms
+POST_BP_ID  = "static.prop.box03"
+ARM_BP_ID   = "static.prop.box02"
+PANEL_BP_ID = "static.prop.box01"
+
+POST_HEIGHT = 8
+BEAM_THICKNESS = 0.15
+
+PORTICO_SPACING_M = 5.0
+NUM_PORTICOS = 180              # Number of "positions" along the segment
+EXTRA_RIGHT_OFFSET = 1.0
+
+# CHANGE: No gantries, ONLY small central panels
+SPAWN_PORTICO_BEAMS = False
+SPAWN_SMALL_PANELS = True
+
+# Small-panel (small cube)
+PANEL_CUBE_S = 0.09
+
+# CHANGE: Height pattern and large sign
+LOW_MINI_Z = 5.5
+HIGH_MINI_Z = 8.0
+LOW_COUNT = 38
+HIGH_COUNT = 21
+CYCLE_MINIS = LOW_COUNT + HIGH_COUNT  # 59 minis and then a large sign
+
+# =========================================================
+# === SIGN (CarlaCola) ===
+# =========================================================
+# PATTERN: 38 low + 21 high + SIGN, repeats.
+SIGN_BOTTOM_Z = 5.5
+SIGN_TOP_Z = 8.0
+SIGN_H_M = SIGN_TOP_Z - SIGN_BOTTOM_Z
+SIGN_CENTER_Z = 0.5 * (SIGN_BOTTOM_Z + SIGN_TOP_Z)
+
+SIGN_W_M = 10.0
+SIGN_FORWARD_OFFSET_M = 0.5
+
+# Physical sign (optimized: few tiles)
+SIGN_TILE_S = 0.50
+SIGN_TILE_STEP = 0.45
+
+# Sign detection parameters
+SIGN_COVERAGE_TH = 0.90
+SIGN_GRID_NX = 24
+SIGN_GRID_NY = 10
+SIGN_DILATE = True
+
+# =========================================================
+# LIDAR (Optimized)
+# =========================================================
+MIN_RANGE_M = 5.0
+MAX_RANGE_M = 250.0
+
+MAX_ABS_Y_M = 25.0
+Z_MIN_M = 0.5
+Z_MAX_M = 9.0
+
+LIDAR_HEIGHT = 3.5
+LIDAR_CHANNELS = 64
+LIDAR_ROT_HZ = 10
+LIDAR_PPS = 600000
+LIDAR_UPPER_FOV = 30
+LIDAR_LOWER_FOV = -20
+
+# =========================================================
+# VISIBILITY (Adaptive)
+# =========================================================
+PLANE_TOL_BASE_M = 0.10
+PLANE_TOL_SLOPE  = 0.006
+PLANE_TOL_MAX_M  = 0.45
+
+PRINT_EVERY_N_FRAMES = 1
+
+# =========================================================
+def wrap_deg(d):
+    while d > 180: d -= 360
+    while d < -180: d += 360
+    return d
+
+def right_vector_from_yaw(yaw_deg: float) -> carla.Vector3D:
+    yaw = math.radians(yaw_deg)
+    return carla.Vector3D(x=math.sin(yaw), y=-math.cos(yaw), z=0.0)
+
+def forward_vector_from_yaw(yaw_deg: float) -> carla.Vector3D:
+    yaw = math.radians(yaw_deg)
+    return carla.Vector3D(x=math.cos(yaw), y=math.sin(yaw), z=0.0)
+
+def add_loc(loc: carla.Location, vec: carla.Vector3D, scale: float) -> carla.Location:
+    return carla.Location(loc.x + vec.x * scale, loc.y + vec.y * scale, loc.z + vec.z * scale)
+
+def set_uniform_scale(bp: carla.ActorBlueprint, s: float):
+    if bp.has_attribute("scale"):
+        bp.set_attribute("scale", str(float(s)))
+
+def inverse_transform_point(transform: carla.Transform, p_world: carla.Location) -> carla.Location:
+    im = transform.get_inverse_matrix()
+    x = im[0][0]*p_world.x + im[0][1]*p_world.y + im[0][2]*p_world.z + im[0][3]
+    y = im[1][0]*p_world.x + im[1][1]*p_world.y + im[1][2]*p_world.z + im[1][3]
+    z = im[2][0]*p_world.x + im[2][1]*p_world.y + im[2][2]*p_world.z + im[2][3]
+    return carla.Location(x, y, z)
+
+def plane_tol_for_dist(dist_m: float) -> float:
+    tol = PLANE_TOL_BASE_M + PLANE_TOL_SLOPE * dist_m
+    return min(tol, PLANE_TOL_MAX_M)
+
+def coverage_rect_on_lidar_yz(points_lidar_xyz, cx, cy, cz, width_m, height_m, dist_m,
+                              grid_nx, grid_ny, dilate):
+    half_w = width_m * 0.5
+    half_h = height_m * 0.5
+    tolx = plane_tol_for_dist(dist_m)
+
+    occ = [[False for _ in range(grid_nx)] for __ in range(grid_ny)]
+
+    for (x, y, z) in points_lidar_xyz:
+        if abs(x - cx) > tolx:
+            continue
+
+        u = y - cy
+        v = z - cz
+        if u < -half_w or u > half_w or v < -half_h or v > half_h:
+            continue
+
+        uu = (u + half_w) / width_m
+        vv = (v + half_h) / height_m
+
+        ix = int(uu * grid_nx)
+        iy = int(vv * grid_ny)
+        ix = max(0, min(grid_nx - 1, ix))
+        iy = max(0, min(grid_ny - 1, iy))
+
+        if dilate:
+            for dy in (-1, 0, 1):
+                for dx in (-1, 0, 1):
+                    jx = ix + dx
+                    jy = iy + dy
+                    if 0 <= jx < grid_nx and 0 <= jy < grid_ny:
+                        occ[jy][jx] = True
+        else:
+            occ[iy][ix] = True
+
+    total = grid_nx * grid_ny
+    hit = sum(1 for iy in range(grid_ny) for ix in range(grid_nx) if occ[iy][ix])
+    cov = hit / float(total) if total else 0.0
+    return cov, hit, total, tolx
+
+# =========================================================
+# BEST BRANCH SELECTION
+# =========================================================
+def choose_best_next(cur_wp: carla.Waypoint, next_list):
+    if not next_list:
+        return None
+
+    cur_yaw = cur_wp.transform.rotation.yaw
+    cur_road = cur_wp.road_id
+    cur_lane = cur_wp.lane_id
+
+    same_lane = [w for w in next_list if (w.road_id == cur_road and w.lane_id == cur_lane and w.lane_type == carla.LaneType.Driving)]
+    cand = same_lane if same_lane else [w for w in next_list if w.lane_type == carla.LaneType.Driving]
+    if not cand:
+        cand = next_list
+
+    best = None
+    best_cost = 1e9
+    for w in cand:
+        yaw = w.transform.rotation.yaw
+        dy = abs(wrap_deg(yaw - cur_yaw))
+        if dy < best_cost:
+            best_cost = dy
+            best = w
+    return best
+
+# =========================================================
+# CLEAN SEGMENT CHECK
+# =========================================================
+def is_clean_segment(start_wp: carla.Waypoint, length_m: float,
+                     max_local_deg: float, max_cum_deg: float,
+                     allow_junction: bool):
+    yaw0 = start_wp.transform.rotation.yaw
+    prev_yaw = yaw0
+    wp = start_wp
+    traveled = 0.0
+    max_local = 0.0
+    junctions = 0
+
+    steps = int(length_m / STEP_M)
+    for _ in range(steps):
+        if (not allow_junction) and wp.is_junction:
+            return False, traveled, max_local, abs(wrap_deg(prev_yaw - yaw0)), junctions
+
+        nxt = wp.next(STEP_M)
+        if not nxt:
+            return False, traveled, max_local, abs(wrap_deg(prev_yaw - yaw0)), junctions
+
+        wp_next = nxt[0] if len(nxt) == 1 else choose_best_next(wp, nxt)
+        if wp_next is None:
+            return False, traveled, max_local, abs(wrap_deg(prev_yaw - yaw0)), junctions
+
+        wp = wp_next
+        traveled += STEP_M
+
+        if wp.is_junction:
+            junctions += 1
+
+        yaw = wp.transform.rotation.yaw
+        local = abs(wrap_deg(yaw - prev_yaw))
+        cum = abs(wrap_deg(yaw - yaw0))
+        max_local = max(max_local, local)
+
+        if local > max_local_deg or cum > max_cum_deg:
+            return False, traveled, max_local, cum, junctions
+
+        prev_yaw = yaw
+
+    cum = abs(wrap_deg(wp.transform.rotation.yaw - yaw0))
+    return True, traveled, max_local, cum, junctions
+
+def find_straight_fast(world):
+    carla_map = world.get_map()
+    spawns = carla_map.get_spawn_points()
+    if not spawns:
+        raise RuntimeError("No spawn points available.")
+
+    N = min(SEARCH_SPAWNS_TO_TRY, len(spawns))
+    idxs = list(range(N))
+    random.shuffle(idxs)
+
+    passes = [
+        ("STRICT", dict(max_local=0.9, max_cum=16.0, allow_junction=False)),
+        ("MEDIUM", dict(max_local=1.4, max_cum=28.0, allow_junction=False)),
+        ("RELAX",  dict(max_local=2.0, max_cum=45.0, allow_junction=True)),
+    ]
+
+    best_global = None
+    best_reached = 0.0
+
+    for mode, cfg in passes:
+        best = None
+        for idx in idxs:
+            sp = spawns[idx]
+            wp = carla_map.get_waypoint(sp.location, project_to_road=True, lane_type=carla.LaneType.Driving)
+            if wp is None:
+                continue
+
+            while wp.get_right_lane() and wp.get_right_lane().lane_type == carla.LaneType.Driving:
+                wp = wp.get_right_lane()
+
+            ok, reached, max_local, cum, junctions = is_clean_segment(
+                wp, MIN_STRAIGHT_LEN_M,
+                cfg["max_local"], cfg["max_cum"],
+                cfg["allow_junction"]
+            )
+
+            best_reached = max(best_reached, reached)
+            if not ok:
+                continue
+
+            score = cum * 1000.0 + max_local * 100.0 + junctions * 5000.0
+            cand = (score, mode, idx, wp, max_local, cum, junctions)
+            if best is None or cand[0] < best[0]:
+                best = cand
+
+        if best is not None:
+            best_global = best
+            break
+
+    if best_global is None:
+        raise RuntimeError(
+            f"Could not find a segment >= {MIN_STRAIGHT_LEN_M:.0f}m. "
+            f"Max reached in search: {best_reached:.1f}m. "
+            f"Try increasing SEARCH_SPAWNS_TO_TRY or decreasing MIN_STRAIGHT_LEN_M."
+        )
+
+    score, mode, idx, wp, max_local, cum, junctions = best_global
+    print(f"[OK] Segment selected ({mode}): spawn_index={idx} | max_local={max_local:.2f}° | cum={cum:.2f}° | junctions={junctions}")
+    return wp
+
+def get_rightmost_driving_and_shoulder(wp: carla.Waypoint):
+    wp_drive = wp
+    wp_shoulder = None
+    cur = wp
+    while True:
+        r = cur.get_right_lane()
+        if r is None:
+            break
+        if r.lane_type == carla.LaneType.Driving:
+            wp_drive = r
+            cur = r
+            continue
+        if r.lane_type == carla.LaneType.Shoulder:
+            wp_shoulder = r
+            break
+        break
+    return wp_drive, wp_shoulder
+
+# =========================================================
+# BATCH SPAWN
+# =========================================================
+def batch_spawn(world, client, bp, transforms):
+    if not transforms:
+        return []
+    cmds = [carla.command.SpawnActor(bp, tf) for tf in transforms]
+    responses = client.apply_batch_sync(cmds, True)
+    actor_ids = []
+    for r in responses:
+        if not r.error:
+            actor_ids.append(r.actor_id)
+    return actor_ids
+
+def spawn_infra_and_signs_fast(world, client, start_wp):
+    bp_lib = world.get_blueprint_library()
+    panel_bp = bp_lib.find(PANEL_BP_ID)
+
+    spawned_ids = []
+    signs_world = []
+
+    # ONLY central mini-panel (one piece) + SIGN tiles
+    small_panel_tfs = []
+    sign_tile_tfs = []
+
+    half_w = SIGN_W_M * 0.5
+    half_h = SIGN_H_M * 0.5
+    ny = max(1, int(SIGN_W_M / SIGN_TILE_STEP))
+    nz = max(1, int(SIGN_H_M / SIGN_TILE_STEP))
+
+    wp = start_wp
+    mini_in_cycle = 0  
+
+    for i in range(1, NUM_PORTICOS + 1):
+        nxt = wp.next(PORTICO_SPACING_M)
+        if not nxt:
+            print(f"[WARN] Road end reached at {i}. Stopping.")
+            break
+
+        wp = nxt[0] if len(nxt) == 1 else choose_best_next(wp, nxt)
+        if wp is None:
+            break
+
+        base_wp = wp
+        wp_drive, wp_shoulder = get_rightmost_driving_and_shoulder(base_wp)
+        target_lane_center = wp_drive.transform.location
+
+        tf = wp_drive.transform if wp_shoulder is None else wp_shoulder.transform
+        yaw = tf.rotation.yaw
+        right_vec = right_vector_from_yaw(yaw)
+        fwd_vec = forward_vector_from_yaw(yaw)
+
+        # =====================================================
+        # MINI-PANELS: Height pattern
+        #  - First 38 at 5.5m
+        #  - Next 21 at 8.0m
+        #  - Right after: Large sign
+        # =====================================================
+        if SPAWN_SMALL_PANELS:
+            mini_in_cycle += 1
+
+            if mini_in_cycle <= LOW_COUNT:
+                z_mini = LOW_MINI_Z
+            else:
+                z_mini = HIGH_MINI_Z
+
+            set_uniform_scale(panel_bp, PANEL_CUBE_S)
+            panel_loc = carla.Location(
+                target_lane_center.x,
+                target_lane_center.y,
+                target_lane_center.z + z_mini
+            )
+            small_panel_tfs.append(carla.Transform(panel_loc, carla.Rotation(0.0, yaw, 0.0)))
+
+            if mini_in_cycle == CYCLE_MINIS:
+                # Spawn SIGN at this position (after the block of 21 high panels)
+                sign_center = carla.Location(
+                    target_lane_center.x,
+                    target_lane_center.y,
+                    target_lane_center.z + SIGN_CENTER_Z
+                )
+                sign_center = add_loc(sign_center, fwd_vec, SIGN_FORWARD_OFFSET_M)
+
+                signs_world.append({"panel_idx": i, "center": sign_center, "width": SIGN_W_M, "height": SIGN_H_M})
+
+                set_uniform_scale(panel_bp, SIGN_TILE_S)
+                for iy in range(ny):
+                    frac_y = -half_w + (iy + 0.5) * (SIGN_W_M / ny)
+                    for iz in range(nz):
+                        frac_z = -half_h + (iz + 0.5) * (SIGN_H_M / nz)
+
+                        tile_loc = carla.Location(sign_center.x, sign_center.y, sign_center.z)
+                        tile_loc = add_loc(tile_loc, right_vec, frac_y)
+                        tile_loc.z += frac_z
+                        sign_tile_tfs.append(carla.Transform(tile_loc, carla.Rotation(0.0, yaw, 0.0)))
+
+                mini_in_cycle = 0  # Reset pattern
+
+    # Spawn batch
+    if SPAWN_SMALL_PANELS:
+        set_uniform_scale(panel_bp, PANEL_CUBE_S)
+        spawned_ids += batch_spawn(world, client, panel_bp, small_panel_tfs)
+
+    set_uniform_scale(panel_bp, SIGN_TILE_S)
+    spawned_ids += batch_spawn(world, client, panel_bp, sign_tile_tfs)
+
+    print(f"[OK] Spawn batch: mini_panels={len(small_panel_tfs)} | sign_tiles={len(sign_tile_tfs)} | signs={len(signs_world)}")
+    return spawned_ids, signs_world
+
+# =========================================================
+def set_spectator_follow(world, vehicle, dist_back=12.0, height=3.0, pitch=-15.0):
+    sp = world.get_spectator()
+    tf = vehicle.get_transform()
+    fwd = tf.get_forward_vector()
+    loc = tf.location - fwd * dist_back
+    loc.z += height
+    rot = carla.Rotation(pitch=pitch, yaw=tf.rotation.yaw, roll=0.0)
+    sp.set_transform(carla.Transform(loc, rot))
+
+# =========================================================
+def main():
+    client = carla.Client("localhost", 2000)
+    client.set_timeout(30.0)
+
+    world = client.get_world()
+    if MAP_NAME not in world.get_map().name:
+        world = client.load_world(MAP_NAME)
+        time.sleep(1.0)
+
+    # Settings (render ON)
+    settings = world.get_settings()
+    settings.synchronous_mode = SYNCHRONOUS_MODE
+    settings.fixed_delta_seconds = FIXED_DT if SYNCHRONOUS_MODE else None
+    settings.no_rendering_mode = NO_RENDERING_MODE
+    world.apply_settings(settings)
+
+    if SYNCHRONOUS_MODE:
+        world.tick()
+    else:
+        world.wait_for_tick()
+
+    # 1) Search segment
+    start_wp = find_straight_fast(world)
+
+    # 2) Spawn minis + signs
+    print("[INFO] Spawning mini-panels + SIGNS (pattern 38/21/sign)...")
+    spawned_ids, signs_world = spawn_infra_and_signs_fast(world, client, start_wp)
+    print(f"[OK] Actors spawned: {len(spawned_ids)}")
+    print(f"[OK] Signs: {len(signs_world)} -> {[s['panel_idx'] for s in signs_world]}")
+
+    # 3) Vehicle
+    bp_lib = world.get_blueprint_library()
+    firetruck_bps = bp_lib.filter("vehicle.carlamotors.firetruck")
+    if not firetruck_bps:
+        raise RuntimeError("Blueprint vehicle.carlamotors.firetruck not found.")
+    veh_bp = firetruck_bps[0]
+
+    vehicle = None
+    wp_try = start_wp
+    for _ in range(40):
+        tf = wp_try.transform
+        tf.location.z += 0.5
+        vehicle = world.try_spawn_actor(veh_bp, tf)
+        if vehicle:
+            break
+        nxt = wp_try.next(10.0)
+        if not nxt:
+            break
+        wp_try = nxt[0] if len(nxt) == 1 else choose_best_next(wp_try, nxt)
+
+    if not vehicle:
+        raise RuntimeError("Could not spawn firetruck.")
+    print(f"[OK] Vehicle: {vehicle.type_id}")
+
+    # Autopilot + TM
+    tm = client.get_trafficmanager()
+    try:
+        tm.set_synchronous_mode(SYNCHRONOUS_MODE)
+    except Exception:
+        pass
+
+    try:
+        vehicle.set_autopilot(True, tm.get_port())
+    except Exception:
+        vehicle.set_autopilot(True)
+
+    try:
+        tm.auto_lane_change(vehicle, False)
+        tm.set_keep_right_rule_percentage(vehicle, 100.0)
+        print("[OK] TM: lane_change OFF + keep_right 100%")
+    except Exception as e:
+        print(f"[WARN] TM config error: {e}")
+
+    set_spectator_follow(world, vehicle)
+
+    # 4) LiDAR
+    lidar_bp = bp_lib.find("sensor.lidar.ray_cast")
+    lidar_bp.set_attribute("range", str(MAX_RANGE_M))
+    lidar_bp.set_attribute("rotation_frequency", str(LIDAR_ROT_HZ))
+    lidar_bp.set_attribute("channels", str(LIDAR_CHANNELS))
+    lidar_bp.set_attribute("points_per_second", str(LIDAR_PPS))
+    lidar_bp.set_attribute("upper_fov", str(LIDAR_UPPER_FOV))
+    lidar_bp.set_attribute("lower_fov", str(LIDAR_LOWER_FOV))
+
+    if lidar_bp.has_attribute("dropoff_general_rate"):
+        lidar_bp.set_attribute("dropoff_general_rate", "0.0")
+    if lidar_bp.has_attribute("dropoff_intensity_limit"):
+        lidar_bp.set_attribute("dropoff_intensity_limit", "0.0")
+    if lidar_bp.has_attribute("dropoff_zero_intensity"):
+        lidar_bp.set_attribute("dropoff_zero_intensity", "0.0")
+
+    lidar = world.spawn_actor(
+        lidar_bp,
+        carla.Transform(carla.Location(x=0.0, z=LIDAR_HEIGHT)),
+        attach_to=vehicle
+    )
+    print("[OK] LiDAR active")
+
+    # =========================================================
+    # LiDAR -> ONLY Large Sign
+    # =========================================================
+    def on_lidar(meas: carla.LidarMeasurement):
+        try:
+            fr = meas.frame
+            if fr % PRINT_EVERY_N_FRAMES != 0:
+                return
+
+            raw = meas.raw_data
+            n = len(raw) // 16
+
+            pts_roi = []
+            if n > 0:
+                unpack = struct.unpack_from
+                for i in range(n):
+                    x, y, z, _intensity = unpack("ffff", raw, i * 16)
+
+                    if x <= 0.0:
+                        continue
+                    r = math.hypot(x, y)
+                    if r < MIN_RANGE_M or r > MAX_RANGE_M:
+                        continue
+                    if abs(y) > MAX_ABS_Y_M:
+                        continue
+                    if z < Z_MIN_M or z > Z_MAX_M:
+                        continue
+                    pts_roi.append((x, y, z))
+
+            if not signs_world:
+                print(f"[{fr}] pts_roi={len(pts_roi)} | NO_SIGNS")
+                return
+
+            lidar_tf = lidar.get_transform()
+
+            evals = []
+            for s in signs_world:
+                pid = s["panel_idx"]
+                pw = s["center"]
+                w = s["width"]
+                h = s["height"]
+
+                pl = inverse_transform_point(lidar_tf, pw)
+                if pl.x <= 0.0:
+                    continue
+
+                dist = math.hypot(pl.x, pl.y)
+                if dist < MIN_RANGE_M or dist > MAX_RANGE_M:
+                    continue
+
+                cov, hit, total, tolx = coverage_rect_on_lidar_yz(
+                    pts_roi, pl.x, pl.y, pl.z,
+                    w, h, dist,
+                    SIGN_GRID_NX, SIGN_GRID_NY, SIGN_DILATE
+                )
+                evals.append({"pid": pid, "dist": dist, "cov": cov})
+
+            if not evals:
+                print(f"[{fr}] pts_roi={len(pts_roi)} | SIGN: none_ahead_in_range")
+                return
+
+            nearest = min(evals, key=lambda d: d["dist"])
+            best = max(evals, key=lambda d: d["cov"])
+
+            nearest_full = nearest["cov"] >= SIGN_COVERAGE_TH
+            best_full = best["cov"] >= SIGN_COVERAGE_TH
+            full_count = sum(1 for d in evals if d["cov"] >= SIGN_COVERAGE_TH)
+
+            print(
+                f"[{fr}] pts_roi={len(pts_roi)} | "
+                f"SIGN_NEAREST panel={nearest['pid']} dist={nearest['dist']:5.1f}m "
+                f"cov={nearest['cov']*100:5.1f}% FULL={int(nearest_full)} | "
+                f"SIGN_BEST panel={best['pid']} dist={best['dist']:5.1f}m "
+                f"cov={best['cov']*100:5.1f}% FULL={int(best_full)} | "
+                f"FULL_SIGNS={full_count}"
+            )
+
+        except Exception as e:
+            print(f"[ERR] on_lidar: {e}")
+
+    lidar.listen(on_lidar)
+
+    print("\n[RUNNING] Rendering ON. Pattern: 38@5.5m + 21@8m + SIGN, repeated.\nCTRL+C to stop.\n")
+
+    try:
+        while True:
+            if SYNCHRONOUS_MODE:
+                world.tick()
+            else:
+                world.wait_for_tick()
+            set_spectator_follow(world, vehicle)
+    except KeyboardInterrupt:
+        pass
+
+    # Cleanup
+    try:
+        lidar.stop()
+    except Exception:
+        pass
+
+    try:
+        lidar.destroy()
+    except Exception:
+        pass
+
+    try:
+        vehicle.destroy()
+    except Exception:
+        pass
+
+    if spawned_ids:
+        cmds = [carla.command.DestroyActor(x) for x in spawned_ids]
+        client.apply_batch_sync(cmds, True)
+
+    try:
+        settings = world.get_settings()
+        settings.synchronous_mode = False
+        settings.fixed_delta_seconds = None
+        settings.no_rendering_mode = False
+        world.apply_settings(settings)
+    except Exception:
+        pass
+
+    print("[OK] Cleanup finished.")
+
+if __name__ == "__main__":
+    main()
